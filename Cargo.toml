@@ -16,3 +16,7 @@ pulldown-cmark = "0.12"
 syntect = "5"
 terminal_size = "0.4"
 textwrap = "0.16"
+unicode-width = "0.2"
+
+[dev-dependencies]
+proptest = "1"

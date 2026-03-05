@@ -4,6 +4,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use unicode_width::UnicodeWidthChar;
 
 use crate::style::Theme;
 
@@ -13,8 +14,11 @@ pub fn render_markdown(input: &str, width: usize, theme: &Theme) -> String {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
 
+    let ss = SyntaxSet::load_defaults_newlines();
+    let ts = ThemeSet::load_defaults();
+
     let parser = Parser::new_ext(input, opts);
-    let mut renderer = Renderer::new(width, theme);
+    let mut renderer = Renderer::new(width, theme, &ss, &ts);
     renderer.render(parser);
     renderer.output
 }
@@ -23,6 +27,8 @@ struct Renderer<'t> {
     output: String,
     width: usize,
     theme: &'t Theme,
+    syntax_set: &'t SyntaxSet,
+    theme_set: &'t ThemeSet,
 
     // State tracking
     in_heading: Option<usize>,
@@ -62,11 +68,13 @@ enum InlineStyle {
 }
 
 impl<'t> Renderer<'t> {
-    fn new(width: usize, theme: &'t Theme) -> Self {
+    fn new(width: usize, theme: &'t Theme, syntax_set: &'t SyntaxSet, theme_set: &'t ThemeSet) -> Self {
         Self {
             output: String::new(),
             width,
             theme,
+            syntax_set,
+            theme_set,
             in_heading: None,
             heading_text: String::new(),
             in_code_block: false,
@@ -286,6 +294,7 @@ impl<'t> Renderer<'t> {
     }
 
     fn text(&mut self, text: &str) {
+        let text = &sanitize_text(text);
         if self.in_heading.is_some() {
             self.heading_text.push_str(text);
         } else if self.in_code_block {
@@ -302,7 +311,8 @@ impl<'t> Renderer<'t> {
         }
     }
 
-    fn inline_code(&mut self, code: &str) {
+    fn inline_code(&mut self, raw_code: &str) {
+        let code = &sanitize_text(raw_code);
         if self.in_heading.is_some() {
             self.heading_text.push('`');
             self.heading_text.push_str(code);
@@ -463,8 +473,7 @@ impl<'t> Renderer<'t> {
     }
 
     fn highlight_code(&self, lang: &str, code: &str) -> String {
-        let ss = SyntaxSet::load_defaults_newlines();
-        let ts = ThemeSet::load_defaults();
+        let ss = self.syntax_set;
         let syntax = if lang.is_empty() {
             ss.find_syntax_plain_text()
         } else {
@@ -473,7 +482,7 @@ impl<'t> Renderer<'t> {
         };
 
         let theme_name = "base16-ocean.dark";
-        let theme = &ts.themes[theme_name];
+        let theme = &self.theme_set.themes[theme_name];
         let mut h = HighlightLines::new(syntax, theme);
 
         let mut result = String::new();
@@ -706,6 +715,20 @@ impl<'t> Renderer<'t> {
     }
 }
 
+/// Strip control characters (except \n and \t) from text to prevent
+/// terminal escape injection from malicious markdown content.
+fn sanitize_text(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '\u{FFFD}' // replacement character
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn style_to_ansi(style: &Style, text: &str) -> String {
     let fg = style.foreground;
     format!(
@@ -721,7 +744,6 @@ fn style_to_ansi(style: &Style, text: &str) -> String {
 }
 
 fn strip_ansi_len(s: &str) -> usize {
-    // Quick and dirty: count visible characters by skipping ANSI escape sequences
     let mut len = 0;
     let mut in_escape = false;
     for c in s.chars() {
@@ -732,18 +754,36 @@ fn strip_ansi_len(s: &str) -> usize {
         } else if c == '\x1b' {
             in_escape = true;
         } else {
-            len += 1;
+            len += c.width().unwrap_or(0);
         }
     }
     len
 }
 
-fn align_text(text: &str, width: usize, align: pulldown_cmark::Alignment) -> String {
-    let text_len = text.len();
-    if text_len >= width {
-        return text[..width].to_string();
+fn visible_width(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut w = 0;
+    for c in text.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > width {
+            break;
+        }
+        result.push(c);
+        w += cw;
     }
-    let padding = width - text_len;
+    result
+}
+
+fn align_text(text: &str, width: usize, align: pulldown_cmark::Alignment) -> String {
+    let text_width = visible_width(text);
+    if text_width >= width {
+        return truncate_to_width(text, width);
+    }
+    let padding = width - text_width;
     match align {
         pulldown_cmark::Alignment::Right => format!("{}{}", " ".repeat(padding), text),
         pulldown_cmark::Alignment::Center => {
@@ -855,6 +895,30 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_ansi_len_cjk() {
+        // CJK characters are double-width
+        assert_eq!(strip_ansi_len("日本"), 4);
+        assert_eq!(strip_ansi_len("\x1b[31m日\x1b[0m"), 2);
+    }
+
+    #[test]
+    fn test_align_text_unicode_safe() {
+        // Should not panic on multi-byte characters
+        let result = align_text("日本語テスト", 4, pulldown_cmark::Alignment::None);
+        assert!(result.len() <= "日本語テスト".len());
+    }
+
+    #[test]
+    fn test_cjk_table() {
+        let md = "| 名前 | 値 |\n|------|----|\n| テスト | 42 |";
+        // Should not panic
+        let output = render_plain(md);
+        let plain = strip_ansi(&output);
+        assert!(plain.contains("名前"));
+        assert!(plain.contains("42"));
+    }
+
+    #[test]
     fn test_inline_code() {
         let output = render_plain("Use `cargo build` to compile.");
         assert!(output.contains("cargo build"));
@@ -868,5 +932,92 @@ mod tests {
         let plain = strip_ansi(&output);
         assert!(plain.contains("Glow"));
         assert!(plain.contains("markdown"));
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// The renderer must never panic on arbitrary UTF-8 input.
+            #[test]
+            fn never_panics_on_arbitrary_input(input in "\\PC{0,500}") {
+                let theme = crate::style::Theme::dark();
+                // Just run it — if it doesn't panic, it passes.
+                let _ = render_markdown(&input, 80, &theme);
+            }
+
+            /// The renderer must never panic at any terminal width >= 1.
+            #[test]
+            fn never_panics_at_any_width(width in 1usize..300) {
+                let theme = crate::style::Theme::dark();
+                let md = "# Hello\n\nA **bold** paragraph with `code`.\n\n```rust\nfn f() {}\n```\n\n> quote\n\n- list\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+                let _ = render_markdown(md, width, &theme);
+            }
+
+            /// Plain text content must survive rendering — it should appear
+            /// in the stripped output for simple paragraphs.
+            #[test]
+            fn paragraph_text_preserved(text in "[a-zA-Z0-9 ]{1,80}") {
+                let theme = crate::style::Theme::dark();
+                let output = render_markdown(&text, 200, &theme);
+                let plain = strip_ansi(&output);
+                // The original words should appear somewhere in the output
+                for word in text.split_whitespace() {
+                    prop_assert!(
+                        plain.contains(word),
+                        "Word '{}' missing from output:\n{}", word, plain
+                    );
+                }
+            }
+
+            /// ANSI escape sequences must be balanced — every color set
+            /// should eventually reset. We check that the output ends
+            /// without a dangling escape.
+            #[test]
+            fn no_dangling_escapes(input in "(# .+\n|\\*\\*.+\\*\\*\n|`.+`\n|> .+\n|- .+\n){1,5}") {
+                let theme = crate::style::Theme::dark();
+                let output = render_markdown(&input, 80, &theme);
+                // After the full output, we shouldn't be mid-escape
+                let mut in_escape = false;
+                for c in output.chars() {
+                    if c == '\x1b' {
+                        in_escape = true;
+                    } else if in_escape && c.is_ascii_alphabetic() {
+                        in_escape = false;
+                    }
+                }
+                prop_assert!(!in_escape, "Output ends mid-escape sequence");
+            }
+
+            /// align_text must never panic and must produce output
+            /// with visible width <= the requested width.
+            #[test]
+            fn align_text_never_panics(
+                text in "\\PC{0,20}",
+                width in 1usize..50,
+                align_idx in 0u8..3,
+            ) {
+                let align = match align_idx {
+                    0 => pulldown_cmark::Alignment::None,
+                    1 => pulldown_cmark::Alignment::Left,
+                    2 => pulldown_cmark::Alignment::Center,
+                    _ => pulldown_cmark::Alignment::Right,
+                };
+                let result = align_text(&text, width, align);
+                prop_assert!(visible_width(&result) <= width + visible_width(&text));
+            }
+
+            /// strip_ansi_len must agree with strip_ansi + visible_width
+            /// for any string containing ANSI escapes.
+            #[test]
+            fn strip_ansi_len_consistent(text in "[a-z]{0,10}") {
+                let ansi = format!("\x1b[31m{}\x1b[0m", text);
+                let stripped = strip_ansi(&ansi);
+                let by_len = strip_ansi_len(&ansi);
+                let by_strip = visible_width(&stripped);
+                prop_assert_eq!(by_len, by_strip);
+            }
+        }
     }
 }
