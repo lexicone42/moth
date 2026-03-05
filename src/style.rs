@@ -26,7 +26,11 @@ impl Theme {
     pub fn from_name(name: &str) -> Self {
         match name {
             "light" => Self::light(),
-            _ => Self::dark(),
+            "dark" => Self::dark(),
+            other => {
+                eprintln!("moth: unknown style '{other}', using dark");
+                Self::dark()
+            }
         }
     }
 
