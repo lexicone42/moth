@@ -1,0 +1,18 @@
+[package]
+name = "moth"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal markdown renderer, inspired by glow"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lexicone42/moth"
+readme = "README.md"
+keywords = ["markdown", "terminal", "cli", "renderer"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+pulldown-cmark = "0.12"
+syntect = "5"
+terminal_size = "0.4"
+textwrap = "0.16"
